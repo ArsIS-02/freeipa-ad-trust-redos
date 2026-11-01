@@ -16,6 +16,7 @@
 
 - [Зачем это](#-зачем-это)
 - [Главная находка: две сборки Samba в РЕД ОС](#-главная-находка-две-сборки-samba-в-ред-ос)
+- [Как это выглядит](#-как-это-выглядит)
 - [Схема лаборатории](#-схема-лаборатории)
 - [Главы](#-главы)
 - [Быстрая шпаргалка](#-быстрая-шпаргалка)
@@ -56,6 +57,17 @@ FreeIPA работает на MIT Kerberos, а в Samba 4.23 появилась 
 команды: [глава 3](docs/03-samba-redos.md). Для сравнения, та же ошибка описана как баг Samba 4.23 в
 [FreeIPA #9847](https://www.pagure.io/freeipa/issue/9847) и
 [Red Hat Bugzilla 2392626](https://bugzilla.redhat.com/show_bug.cgi?id=2392626).
+
+## 🖼️ Как это выглядит
+
+<table>
+  <tr>
+    <td align="center"><b>Создание доверия</b><br><img src="docs/images/term-trust-add.png" alt="ipa trust-add" width="520"/></td>
+    <td align="center"><b>Письмо алерта Graylog</b><br><img src="docs/images/mail-trust-alert.png" alt="Письмо о создании доверия" width="360"/></td>
+  </tr>
+</table>
+
+На снимках реальный вывод и реальное событие, имена доменов, хостов и SID заменены на вымышленные.
 
 ## 🗺️ Схема лаборатории
 
