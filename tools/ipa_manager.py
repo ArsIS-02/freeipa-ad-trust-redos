@@ -100,6 +100,28 @@ def _os_name():
     return platform.platform()
 
 
+def _current_principal():
+    """Имя и тип учётной записи, под которой выполняются запросы к IPA."""
+    try:  # штатная команда ipa whoami
+        r = cmd("whoami")
+        res = r.get("result", r) if hasattr(r, "get") else {}
+        args = res.get("arguments") or ()
+        if args:
+            return str(args[0]), res.get("object") or "user"
+    except Exception:
+        pass
+    try:  # запасной путь: основной принципал из кэша Kerberos
+        out = subprocess.run(["klist"], capture_output=True, text=True, timeout=5).stdout
+        for ln in out.splitlines():
+            if ln.lower().startswith("default principal:"):
+                princ = ln.split(":", 1)[1].strip()
+                name = princ.split("@")[0]
+                return name, ("service" if "/" in name else "user")
+    except Exception:
+        pass
+    return None, None
+
+
 def build_header():
     """Собирает сведения для шапки один раз при подключении."""
     env = Ctx.api.env
@@ -110,24 +132,23 @@ def build_header():
         h["version"] = str(cmd("ping").get("summary", "-")).strip()
     except Exception:
         pass
-    try:
-        who = cmd("whoami")["result"]
-        kind, args = who.get("object"), who.get("arguments") or ()
-        name = str(args[0]) if args else "-"
-        h["principal"] = f"{name} ({kind})" if kind else name
+    name, kind = _current_principal()
+    if name:
+        h["principal"] = f"{name} ({kind})"
         if kind == "user":
-            u = cmd("user_show", name, all=True)["result"]
-            h["display"] = first(u.get("displayname")) or first(u.get("cn"), "-")
-            groups = set(u.get("memberof_group", ())) | set(u.get("memberofindirect_group", ()))
-            roles = list(u.get("memberof_role", ()))
-            if "admins" in groups:
-                h["rights"] = "администратор FreeIPA (группа admins)"
-            else:
-                h["rights"] = "не в группе admins: часть действий может быть недоступна"
-            if roles:
-                h["rights"] += f"; роли: {', '.join(roles)}"
-    except Exception:
-        pass
+            try:
+                u = cmd("user_show", name, all=True)["result"]
+                h["display"] = first(u.get("displayname")) or first(u.get("cn"), "-")
+                groups = set(u.get("memberof_group", ())) | set(u.get("memberofindirect_group", ()))
+                roles = list(u.get("memberof_role", ()))
+                if "admins" in groups:
+                    h["rights"] = "администратор FreeIPA (группа admins)"
+                else:
+                    h["rights"] = "не в группе admins: часть действий может быть недоступна"
+                if roles:
+                    h["rights"] += f"; роли: {', '.join(roles)}"
+            except Exception:
+                pass
     ips = _local_ips()
     h["host"] = {
         "name": socket.gethostname(), "fqdn": socket.getfqdn(), "ips": ", ".join(ips) or "н/д",
@@ -263,7 +284,10 @@ def list_users():
     crit = ask("Строка для поиска (пусто: все)", "")
     kw = {"sizelimit": 0}
     users = cmd("user_find", crit, **kw)["result"] if crit else cmd("user_find", **kw)["result"]
-    rows = [[first(u.get("uid")), first(u.get("cn")), first(u.get("mail")),
+    rows = [[first(u.get("uid")),
+             first(u.get("displayname")) or first(u.get("cn")) or " ".join(
+                 str(first(u.get(k))) for k in ("givenname", "sn") if u.get(k)),
+             first(u.get("mail")),
              "отключён" if first(u.get("nsaccountlock"), False) else "активен"] for u in users]
     if not rows:
         print("Ничего не найдено")
