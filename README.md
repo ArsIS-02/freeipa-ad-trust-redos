@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/License-GPL%20v3-blue?style=for-the-badge" alt="License"/>
 </p>
 
-# 🤝 Доверие между FreeIPA и Active Directory на РЕД ОС
+# 🤝 Доверие между FreeIPA на РЕД ОС 8.0.3 и Active Directory на Windows Server 2025
 
 > Пошаговая инструкция: как связать домен FreeIPA на РЕД ОС с доменом Windows Server 2025 так, чтобы
 > пользователи AD входили на хосты IPA. С DNS, Samba, группами, HBAC, диагностикой типовых ошибок и
