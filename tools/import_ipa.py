@@ -49,33 +49,19 @@ def ensure_group(api, errors, name, description):
         return False
 
 
-def do_import(args):
-    rows = read_rows(args.csv)
+def import_rows(api, errors, rows, marker, mail_domain):
+    """Создаёт группы отделов и пользователей из строк CSV. Возвращает (создано, пропущено, ошибок)."""
     groups = {}
     for r in rows:
         groups[r["dept_group"]] = r["department"]
 
-    if args.dry_run:
-        print(f"[dry-run] группа-метка: {args.marker}")
-        print(f"[dry-run] групп отделов: {len(groups)}: {', '.join(sorted(groups))}")
-        print(f"[dry-run] пользователей: {len(rows)}")
-        for r in rows[:5]:
-            print(f"[dry-run]   {r['login']}  {r['display_name']}  ({r['department']})")
-        if len(rows) > 5:
-            print(f"[dry-run]   ... и ещё {len(rows) - 5}")
-        return
-
-    from ipalib import errors
-    api = connect()
-    domain = args.mail_domain or api.env.domain
-
-    if ensure_group(api, errors, args.marker, "Тестовые учётные записи (создано import_ipa.py)"):
-        print(f"Создана группа-метка {args.marker}")
+    if ensure_group(api, errors, marker, "Тестовые учётные записи (создано скриптами из репозитория)"):
+        print(f"Создана группа-метка {marker}")
     for name, dept in sorted(groups.items()):
         if ensure_group(api, errors, name, dept):
             print(f"Создана группа {name} ({dept})")
             # вкладываем в метку только группы, созданные здесь: чужие группы очистка не тронет
-            api.Command.group_add_member(args.marker, group=[name])
+            api.Command.group_add_member(marker, group=[name])
         else:
             print(f"Группа {name} уже существовала, она останется после очистки")
 
@@ -86,7 +72,7 @@ def do_import(args):
             api.Command.user_add(
                 login,
                 givenname=r["first_name"], sn=r["last_name"], cn=r["display_name"],
-                displayname=r["display_name"], mail=[f"{login}@{domain}"],
+                displayname=r["display_name"], mail=[f"{login}@{mail_domain}"],
                 userpassword=r["password"],
             )
         except errors.DuplicateEntry:
@@ -96,29 +82,31 @@ def do_import(args):
             failed += 1
             print(f"Ошибка {login}: {e}", file=sys.stderr)
             continue
-        api.Command.group_add_member(args.marker, user=[login])
+        api.Command.group_add_member(marker, user=[login])
         api.Command.group_add_member(r["dept_group"], user=[login])
         created += 1
     print(f"Готово: создано {created}, уже существовало {skipped}, ошибок {failed}")
+    return created, skipped, failed
 
 
-def do_cleanup(args):
-    from ipalib import errors
-    api = connect()
+def cleanup_marker(api, errors, marker, yes=False, dry_run=False):
+    """Удаляет пользователей и группы, помеченные группой marker, и саму метку."""
     try:
-        res = api.Command.group_show(args.marker)["result"]
+        res = api.Command.group_show(marker)["result"]
     except errors.NotFound:
-        sys.exit(f"Группа {args.marker} не найдена: удалять нечего")
+        print(f"Группа {marker} не найдена: удалять нечего")
+        return False
     users = sorted(res.get("member_user", ()))
     groups = sorted(res.get("member_group", ()))
-    print(f"Будет удалено: пользователей {len(users)}, групп отделов {len(groups)}, группа {args.marker}")
+    print(f"Будет удалено: пользователей {len(users)}, групп отделов {len(groups)}, группа {marker}")
     if users:
         print("Пользователи:", ", ".join(users[:10]) + (" ..." if len(users) > 10 else ""))
-    if args.dry_run:
+    if dry_run:
         print("[dry-run] ничего не удалено")
-        return
-    if not args.yes and input("Удалить без возможности восстановления? Введи yes: ").strip() != "yes":
-        sys.exit("Отменено")
+        return False
+    if not yes and input("Удалить без возможности восстановления? Введи yes: ").strip() != "yes":
+        print("Отменено")
+        return False
     for u in users:
         try:
             api.Command.user_del(u)
@@ -129,8 +117,32 @@ def do_cleanup(args):
             api.Command.group_del(g)
         except Exception as e:
             print(f"Ошибка при удалении группы {g}: {e}", file=sys.stderr)
-    api.Command.group_del(args.marker)
+    api.Command.group_del(marker)
     print("Очистка завершена")
+    return True
+
+
+def do_import(args):
+    rows = read_rows(args.csv)
+    groups = {r["dept_group"]: r["department"] for r in rows}
+    if args.dry_run:
+        print(f"[dry-run] группа-метка: {args.marker}")
+        print(f"[dry-run] групп отделов: {len(groups)}: {', '.join(sorted(groups))}")
+        print(f"[dry-run] пользователей: {len(rows)}")
+        for r in rows[:5]:
+            print(f"[dry-run]   {r['login']}  {r['display_name']}  ({r['department']})")
+        if len(rows) > 5:
+            print(f"[dry-run]   ... и ещё {len(rows) - 5}")
+        return
+    from ipalib import errors
+    api = connect()
+    import_rows(api, errors, rows, args.marker, args.mail_domain or api.env.domain)
+
+
+def do_cleanup(args):
+    from ipalib import errors
+    api = connect()
+    cleanup_marker(api, errors, args.marker, yes=args.yes, dry_run=args.dry_run)
 
 
 def main():

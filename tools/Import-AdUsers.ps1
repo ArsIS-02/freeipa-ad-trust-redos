@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Импорт тестовых пользователей и групп в Active Directory из CSV, который делает gen_users.py.
 
