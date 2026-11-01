@@ -528,10 +528,22 @@ function Show-MainMenu {
 }
 
 # ---------- Запуск ----------
-if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-    Write-Err "Модуль ActiveDirectory не найден. Установи RSAT (RSAT-AD-PowerShell) или запусти на контроллере домена."
-    exit 1
+function Stop-Script([string]$Message) {
+    if ($Message) { Write-Warn $Message }
+    Read-Host "`nНажми Enter, чтобы закрыть окно" | Out-Null
 }
-Import-Module ActiveDirectory -ErrorAction Stop
-if (-not (Select-Domain -Name $Domain)) { Write-Warn "Домен не выбран, выход."; exit 1 }
-Show-MainMenu
+try {
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+        Write-Err "Модуль ActiveDirectory не найден."
+        Write-Host "Запусти скрипт на контроллере домена или установи RSAT:"
+        Write-Host "  Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0   (Windows 10/11)"
+        Write-Host "  Install-WindowsFeature RSAT-AD-PowerShell                                        (Windows Server)"
+        Stop-Script
+    } else {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        if (Select-Domain -Name $Domain) { Show-MainMenu } else { Stop-Script "Домен не выбран, выход." }
+    }
+} catch {
+    Write-Err "Непредвиденная ошибка: $_"
+    Stop-Script
+}
