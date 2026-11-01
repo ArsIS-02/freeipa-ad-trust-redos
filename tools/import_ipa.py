@@ -19,6 +19,7 @@
 import argparse
 import csv
 import sys
+import textwrap
 
 
 def read_rows(path):
@@ -98,9 +99,14 @@ def cleanup_marker(api, errors, marker, yes=False, dry_run=False):
         return False
     users = sorted(res.get("member_user", ()))
     groups = sorted(res.get("member_group", ()))
-    print(f"Будет удалено: пользователей {len(users)}, групп отделов {len(groups)}, группа {marker}")
     if users:
-        print("Пользователи:", ", ".join(users[:10]) + (" ..." if len(users) > 10 else ""))
+        print(f"Пользователи ({len(users)}):")
+        print(textwrap.fill(", ".join(users), width=100, initial_indent="  ", subsequent_indent="  "))
+    if groups:
+        print(f"Группы отделов ({len(groups)}):")
+        print(textwrap.fill(", ".join(groups), width=100, initial_indent="  ", subsequent_indent="  "))
+    print(f"Будет удалено: пользователей {len(users)}, групп отделов {len(groups)}, группа {marker}")
+    print("Проверь список: удаляются все участники группы-метки, даже если их создал не скрипт.")
     if dry_run:
         print("[dry-run] ничего не удалено")
         return False

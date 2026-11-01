@@ -13,8 +13,12 @@
 import csv
 import getpass
 import os
+import platform
 import random
+import socket
+import subprocess
 import sys
+import textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen_users      # noqa: E402  генератор случайных людей
@@ -75,16 +79,96 @@ def read_password():
         say("r", "Пароли не совпадают, попробуй ещё раз")
 
 
+# ---------- Шапка: домен, учётная запись, хост ----------
+def _local_ips():
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True, timeout=5).stdout
+        ips = [ln.split()[3].split("/")[0] for ln in out.splitlines() if len(ln.split()) > 3]
+        return [i for i in ips if not i.startswith("127.")]
+    except Exception:
+        return []
+
+
+def _os_name():
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            for ln in f:
+                if ln.startswith("PRETTY_NAME="):
+                    return ln.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return platform.platform()
+
+
+def build_header():
+    """Собирает сведения для шапки один раз при подключении."""
+    env = Ctx.api.env
+    h = {"domain": env.domain, "realm": getattr(env, "realm", "-"),
+         "server": getattr(env, "server", None) or getattr(env, "host", "-"),
+         "version": "-", "principal": "-", "display": "-", "rights": "не удалось определить"}
+    try:
+        h["version"] = str(cmd("ping").get("summary", "-")).strip()
+    except Exception:
+        pass
+    try:
+        who = cmd("whoami")["result"]
+        kind, args = who.get("object"), who.get("arguments") or ()
+        name = str(args[0]) if args else "-"
+        h["principal"] = f"{name} ({kind})" if kind else name
+        if kind == "user":
+            u = cmd("user_show", name, all=True)["result"]
+            h["display"] = first(u.get("displayname")) or first(u.get("cn"), "-")
+            groups = set(u.get("memberof_group", ())) | set(u.get("memberofindirect_group", ()))
+            roles = list(u.get("memberof_role", ()))
+            if "admins" in groups:
+                h["rights"] = "администратор FreeIPA (группа admins)"
+            else:
+                h["rights"] = "не в группе admins: часть действий может быть недоступна"
+            if roles:
+                h["rights"] += f"; роли: {', '.join(roles)}"
+    except Exception:
+        pass
+    ips = _local_ips()
+    h["host"] = {
+        "name": socket.gethostname(), "fqdn": socket.getfqdn(), "ips": ", ".join(ips) or "н/д",
+        "os": _os_name(), "py": platform.python_version(), "user": getpass.getuser(),
+        "root": hasattr(os, "geteuid") and os.geteuid() == 0,
+    }
+    return h
+
+
+def show_header():
+    h = Ctx.header
+    print(f"\n{C['m']}========== УПРАВЛЕНИЕ FreeIPA: {Ctx.api.env.domain} =========={C['0']}")
+    if not h:
+        return
+    w = h["host"]
+    rows = [
+        ("Домен:", f"{h['domain']}, область Kerberos {h['realm']}"),
+        ("Сервер IPA:", f"{h['server']}   ({h['version']})"),
+        ("Учётная запись:", f"{h['principal']}, {h['display']}"),
+        ("Права:", h["rights"]),
+        ("АРМ:", f"{w['name']} ({w['fqdn']})"),
+        ("", f"IP {w['ips']}"),
+        ("", f"{w['os']}; Python {w['py']}; локальный пользователь {w['user']}{' (root)' if w['root'] else ''}"),
+    ]
+    for label, value in rows:
+        print(f"{C['c']}{label:<17}{C['0']}{value}")
+    print("-" * 60)
+
+
 # ---------- Подключение ----------
 class Ctx:
     api = None
     errors = None
+    header = None
 
 
 def connect():
     from ipalib import errors
     Ctx.errors = errors
     Ctx.api = import_ipa.connect()
+    Ctx.header = build_header()
 
 
 def cmd(name, *args, **kw):
@@ -188,22 +272,31 @@ def list_users():
     print(f"\nВсего: {len(rows)}")
 
 
-def show_user():
-    title("Карточка пользователя")
-    uid = ask("Логин")
-    if not uid:
-        return
+def print_user(uid):
+    """Печатает карточку пользователя. Возвращает False, если его нет."""
     try:
         u = cmd("user_show", uid, all=True)["result"]
     except Ctx.errors.NotFound:
         say("r", f"Пользователь {uid} не найден")
-        return
+        return False
     for label, key in [("Логин", "uid"), ("Имя", "givenname"), ("Фамилия", "sn"), ("Отображаемое имя", "displayname"),
                        ("Почта", "mail"), ("Принципал", "krbprincipalname"), ("Оболочка", "loginshell"),
                        ("Домашний каталог", "homedirectory"), ("UID", "uidnumber")]:
         print(f"{label + ':':<20}{', '.join(str(x) for x in (u.get(key) or ['-']))}")
     print(f"{'Заблокирован:':<20}{'да' if first(u.get('nsaccountlock'), False) else 'нет'}")
-    print(f"{'Группы:':<20}{', '.join(u.get('memberof_group', ())) or '-'}")
+    groups = list(u.get("memberof_group", ()))
+    print(f"{'Группы (' + str(len(groups)) + '):':<20}{', '.join(groups) or '-'}")
+    for label, key in [("Правила HBAC", "memberof_hbacrule"), ("Правила sudo", "memberof_sudorule"), ("Роли", "memberof_role")]:
+        if u.get(key):
+            print(f"{label + ':':<20}{', '.join(u[key])}")
+    return True
+
+
+def show_user():
+    title("Карточка пользователя")
+    uid = ask("Логин")
+    if uid:
+        print_user(uid)
 
 
 def add_user():
@@ -241,10 +334,13 @@ def delete_user():
     uid = ask("Логин")
     if not uid:
         return
-    if not user_exists(uid):
-        say("r", f"Пользователь {uid} не найден")
+    say("c", "Будет удалена учётная запись:")
+    if not print_user(uid):
         return
-    if confirm(f"Удалить {uid} без возможности восстановления?"):
+    me = (Ctx.header or {}).get("principal", "").split(" ")[0]
+    if me == uid:
+        say("y", "ВНИМАНИЕ: это учётная запись, под которой запущен скрипт.")
+    if confirm(f"\nУдалить {uid} без возможности восстановления?"):
         try:
             cmd("user_del", uid)
             say("g", f"Пользователь {uid} удалён")
@@ -308,6 +404,29 @@ def add_group():
         say("r", f"Ошибка: {e}")
 
 
+def print_group(name):
+    """Печатает сведения о группе и состав. Возвращает число участников или None, если группы нет."""
+    try:
+        g = cmd("group_show", name, all=True)["result"]
+    except Ctx.errors.NotFound:
+        say("r", f"Группа {name} не найдена")
+        return None
+    users, groups = list(g.get("member_user", ())), list(g.get("member_group", ()))
+    ext = list(g.get("ipaexternalmember", ()))
+    print(f"{'Группа:':<20}{name}")
+    print(f"{'Описание:':<20}{first(g.get('description'), '-')}")
+    print(f"{'GID:':<20}{first(g.get('gidnumber'), '-')}")
+    print(f"{'Входит в группы:':<20}{', '.join(g.get('memberof_group', ())) or '-'}")
+    for label, key in [("Правила HBAC", "memberof_hbacrule"), ("Правила sudo", "memberof_sudorule")]:
+        if g.get(key):
+            print(f"{label + ':':<20}{', '.join(g[key])}")
+    print(f"{'Пользователи (' + str(len(users)) + '):':<20}{', '.join(sorted(users)) or '-'}")
+    print(f"{'Группы (' + str(len(groups)) + '):':<20}{', '.join(sorted(groups)) or '-'}")
+    if ext:
+        print(f"{'Внешние (AD) (' + str(len(ext)) + '):':<20}{', '.join(ext)}")
+    return len(users) + len(groups) + len(ext)
+
+
 def delete_group():
     title("Удаление группы")
     name = ask("Имя группы")
@@ -317,29 +436,28 @@ def delete_group():
     if name in ("admins", "editors", "trust admins", "ipausers"):
         say("r", f"Группа {name} служебная, её нельзя удалять здесь")
         return
-    if confirm(f"Удалить группу {name}?"):
+    say("c", "Будет удалена группа:")
+    total = print_group(name)
+    if total:
+        say("y", f"В группе {total} участников. Сами записи не удаляются, но потеряют права, выданные через эту группу.")
+        ok = ask("\nДля удаления введи yes") == "yes"
+    else:
+        ok = confirm(f"\nУдалить группу {name}?")
+    if ok:
         try:
             cmd("group_del", name)
             say("g", f"Группа {name} удалена")
         except Exception as e:
             say("r", f"Ошибка: {e}")
+    else:
+        say("y", "Отменено")
 
 
 def show_members():
     title("Участники группы")
     name = ask("Имя группы")
-    if not name:
-        return
-    try:
-        g = cmd("group_show", name)["result"]
-    except Ctx.errors.NotFound:
-        say("r", f"Группа {name} не найдена")
-        return
-    print(f"Пользователи: {', '.join(g.get('member_user', ())) or '-'}")
-    print(f"Группы:       {', '.join(g.get('member_group', ())) or '-'}")
-    ext = g.get("ipaexternalmember")
-    if ext:
-        print(f"Внешние (AD): {', '.join(ext)}")
+    if name:
+        print_group(name)
 
 
 def add_to_group(uid=None, group=None, quiet=False):
@@ -365,6 +483,16 @@ def remove_from_group():
     uid, group = ask("Логин"), ask("Группа")
     if not group_exists(group):
         say("r", f"Группа {group} не найдена")
+        return
+    say("c", f"Текущий состав группы {group}:")
+    g = cmd("group_show", group)["result"]
+    members = sorted(g.get("member_user", ()))
+    print(f"Пользователи ({len(members)}): {', '.join(members) or '-'}")
+    if uid not in members:
+        say("y", f"{uid} не состоит в группе {group}")
+        return
+    if not confirm(f"Убрать {uid} из {group}?"):
+        say("y", "Отменено")
         return
     try:
         cmd("group_remove_member", group, user=[uid])
@@ -437,7 +565,7 @@ MENU = [
 def main():
     connect()
     while True:
-        print(f"\n{C['m']}========== УПРАВЛЕНИЕ FreeIPA: {Ctx.api.env.domain} =========={C['0']}")
+        show_header()
         for i, (label, _) in enumerate(MENU, 1):
             print(f"{i:>2}. {label}")
         print(" 0. Выход")
