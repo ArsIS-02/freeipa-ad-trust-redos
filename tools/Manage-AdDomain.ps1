@@ -62,8 +62,92 @@ function Select-Domain {
         $script:DomainDN   = $d.DistinguishedName
         $script:NetBIOS    = $d.NetBIOSName
         Write-Ok "Подключено к домену $($script:DomainFQDN) ($($script:DomainDN)), контроллер $($d.PDCEmulator)"
+        Update-Header -Domain $d
         return $true
     }
+}
+
+# ---------- Шапка: домен, учётная запись, АРМ ----------
+$script:Hdr = $null
+
+function Get-WorkstationInfo {
+    $w = [ordered]@{}
+    $w.Name = $env:COMPUTERNAME
+    try { $w.Fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName } catch { $w.Fqdn = $env:COMPUTERNAME }
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $w.Joined = if ($cs.PartOfDomain) { "в домене $($cs.Domain)" } else { "рабочая группа $($cs.Workgroup)" }
+    } catch { $w.Joined = 'н/д' }
+    try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop; $w.Os = "$($os.Caption), сборка $($os.BuildNumber)" }
+    catch { $w.Os = [Environment]::OSVersion.VersionString }
+    try {
+        $w.Ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } | Select-Object -ExpandProperty IPAddress) -join ', '
+    } catch { $w.Ip = 'н/д' }
+    try {
+        $w.Mac = (Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty MacAddress) -join ', '
+    } catch { $w.Mac = 'н/д' }
+    $w.Ps = $PSVersionTable.PSVersion.ToString()
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $w.WinUser = $id.Name
+    $w.Elevated = ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    return $w
+}
+
+function Get-AccountInfo {
+    param($WinUser)
+    $p = $script:ADParams
+    $a = [ordered]@{}
+    if ($p.ContainsKey('Credential')) { $a.Name = $p.Credential.UserName; $a.Source = 'введена при запуске' }
+    else { $a.Name = $WinUser; $a.Source = 'текущий сеанс Windows' }
+    $a.Display = '-'; $a.Sid = '-'; $a.Rights = 'не удалось определить'
+    try {
+        $sam = ($a.Name -split '\\')[-1] -replace '@.*$', ''
+        $u = Get-ADUser -Identity $sam -Properties DisplayName @p -ErrorAction Stop
+        $a.Display = if ($u.DisplayName) { $u.DisplayName } else { $u.Name }
+        $a.Sid = $u.SID.Value
+        $g = @(Get-ADPrincipalGroupMembership -Identity $u @p -ErrorAction Stop)
+        $r = @()
+        if ($g | Where-Object { $_.SID.Value -match '-512$' }) { $r += 'Администраторы домена' }
+        if ($g | Where-Object { $_.SID.Value -match '-519$' }) { $r += 'Администраторы предприятия' }
+        if ($g | Where-Object { $_.SID.Value -eq 'S-1-5-32-544' }) { $r += 'Администраторы (встроенная)' }
+        $a.Rights = if ($r.Count) { $r -join ', ' } else { 'нет административных групп: часть действий может быть недоступна' }
+    } catch { }
+    return $a
+}
+
+function Update-Header {
+    param($Domain)
+    $p = $script:ADParams
+    $f = $null; $dc = $null
+    try { $f = Get-ADForest @p -ErrorAction Stop } catch { }
+    try { $dc = (Get-ADDomainController @p -ErrorAction Stop).HostName } catch { }
+    $ws = Get-WorkstationInfo
+    $script:Hdr = @{
+        Domain = $Domain; Forest = $f; Dc = $dc; Ws = $ws
+        Account = (Get-AccountInfo -WinUser $ws.WinUser)
+    }
+}
+
+function Show-Header {
+    $h = $script:Hdr
+    Write-Host "========== УПРАВЛЕНИЕ AD: $($script:DomainFQDN) ==========" -ForegroundColor Magenta
+    if (-not $h) { return }
+    $d = $h.Domain; $a = $h.Account; $w = $h.Ws
+    Write-Host "Домен:            " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($d.DNSRoot) ($($d.NetBIOSName)), лес $(if ($h.Forest) { $h.Forest.Name } else { '-' }), уровень $($d.DomainMode)"
+    Write-Host "Контроллер:       " -NoNewline -ForegroundColor Cyan
+    Write-Host "$(if ($h.Dc) { $h.Dc } else { '-' })   (PDC: $($d.PDCEmulator))"
+    Write-Host "Учётная запись:   " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($a.Name)   [$($a.Source)]"
+    Write-Host "                  $($a.Display), SID $($a.Sid)"
+    Write-Host "Права:            " -NoNewline -ForegroundColor Cyan
+    Write-Host $a.Rights
+    Write-Host "АРМ:              " -NoNewline -ForegroundColor Cyan
+    Write-Host "$($w.Name) ($($w.Fqdn)), $($w.Joined)"
+    Write-Host "                  IP $($w.Ip); MAC $($w.Mac)"
+    Write-Host "                  $($w.Os); PowerShell $($w.Ps); от администратора: $(if ($w.Elevated) { 'да' } else { 'нет' })"
+    Write-Host ("-" * 60) -ForegroundColor DarkGray
 }
 
 # ---------- Общие функции ----------
@@ -158,12 +242,15 @@ function Show-Users {
 }
 
 function Show-UserCard {
+    param([string]$Login)
     $p = $script:ADParams
-    Write-Title "Карточка пользователя"
-    $n = Read-Host "Логин"
-    if (-not $n) { return }
-    if (-not (Test-UserExists $n)) { Write-Err "Пользователь $n не найден"; return }
-    $u = Get-ADUser -Identity $n -Properties * @p
+    if (-not $Login) {
+        Write-Title "Карточка пользователя"
+        $Login = Read-Host "Логин"
+        if (-not $Login) { return }
+    }
+    if (-not (Test-UserExists $Login)) { Write-Err "Пользователь $Login не найден"; return }
+    $u = Get-ADUser -Identity $Login -Properties * @p
     Write-Host "Логин:               $($u.SamAccountName)"
     Write-Host "Имя:                 $($u.GivenName) $($u.Surname)"
     Write-Host "Отображаемое имя:    $($u.DisplayName)"
@@ -176,7 +263,7 @@ function Show-UserCard {
     Write-Host "Последний вход:      $($u.LastLogonDate)"
     Write-Host "Расположение:        $($u.DistinguishedName)"
     $groups = @($u.MemberOf | ForEach-Object { ($_ -split ',')[0] -replace '^CN=' })
-    Write-Host "Группы:              $(if ($groups.Count) { $groups -join ', ' } else { '-' })"
+    Write-Host "Группы ($($groups.Count)):         $(if ($groups.Count) { $groups -join ', ' } else { '-' })"
 }
 
 function Add-User {
@@ -213,7 +300,11 @@ function Remove-User {
     $n = Read-Host "Логин"
     if (-not $n) { return }
     if (-not (Test-UserExists $n)) { Write-Err "Пользователь $n не найден"; return }
-    if ((Read-Host "Удалить $n из $($script:DomainFQDN) без возможности восстановления? (y/n)") -eq 'y') {
+    Write-Info "Будет удалена учётная запись:"
+    Show-UserCard -Login $n
+    $me = ($script:Hdr.Account.Name -split '\\')[-1] -replace '@.*$', ''
+    if ($me -ieq $n) { Write-Warn "ВНИМАНИЕ: это учётная запись, под которой запущен скрипт." }
+    if ((Read-Host "`nУдалить $n из $($script:DomainFQDN) без возможности восстановления? (y/n)") -eq 'y') {
         try { Remove-ADUser -Identity $n -Confirm:$false @p -ErrorAction Stop; Write-Ok "Пользователь $n удалён" }
         catch { Write-Err "Ошибка: $_" }
     } else { Write-Warn "Отменено" }
@@ -274,6 +365,26 @@ function Add-Group {
     } catch { Write-Err "Ошибка: $_" }
 }
 
+function Show-GroupDetails {
+    param([string]$Name)
+    $p = $script:ADParams
+    $g = Get-ADGroup -Identity $Name -Properties Description, MemberOf, whenCreated @p
+    Write-Host "Группа:              $($g.Name)"
+    Write-Host "Категория, область:  $($g.GroupCategory), $($g.GroupScope)"
+    Write-Host "Описание:            $($g.Description)"
+    Write-Host "Создана:             $($g.whenCreated)"
+    Write-Host "Расположение:        $($g.DistinguishedName)"
+    $parents = @($g.MemberOf | ForEach-Object { ($_ -split ',')[0] -replace '^CN=' })
+    Write-Host "Входит в группы:     $(if ($parents.Count) { $parents -join ', ' } else { '-' })"
+    $m = @(Get-ADGroupMember -Identity $Name @p)
+    if ($m.Count -eq 0) { Write-Host "Участников нет" }
+    else {
+        Write-Info "Участники ($($m.Count)):"
+        $m | Sort-Object Name | Format-Table Name, SamAccountName, objectClass -AutoSize | Out-Host
+    }
+    return $m.Count
+}
+
 function Remove-Group {
     $p = $script:ADParams
     Write-Title "Удаление группы"
@@ -283,7 +394,15 @@ function Remove-Group {
     if ($g.DistinguishedName -like '*CN=Builtin,*' -or ($g.SID.Value -match '-(\d+)$' -and [int]$Matches[1] -lt 1000)) {
         Write-Err "Группа $name встроенная, её нельзя удалять здесь"; return
     }
-    if ((Read-Host "Удалить группу $name? (y/n)") -eq 'y') {
+    Write-Info "Будет удалена группа:"
+    $count = Show-GroupDetails -Name $name
+    if ($count -gt 0) {
+        Write-Warn "В группе $count участников. Сами учётные записи не удаляются, но потеряют права, выданные через эту группу."
+        $ok = (Read-Host "`nДля удаления введи yes") -eq 'yes'
+    } else {
+        $ok = (Read-Host "`nУдалить группу $name? (y/n)") -eq 'y'
+    }
+    if ($ok) {
         try { Remove-ADGroup -Identity $name -Confirm:$false @p -ErrorAction Stop; Write-Ok "Группа $name удалена" }
         catch { Write-Err "Ошибка: $_" }
     } else { Write-Warn "Отменено" }
@@ -316,8 +435,16 @@ function Remove-UserFromGroup {
     $u = Read-Host "Логин"; $g = Read-Host "Группа"
     if (-not (Test-UserExists $u))  { Write-Err "Пользователь $u не найден"; return }
     if (-not (Test-GroupExists $g)) { Write-Err "Группа $g не найдена"; return }
-    try { Remove-ADGroupMember -Identity $g -Members $u -Confirm:$false @p -ErrorAction Stop; Write-Ok "$u убран из $g" }
-    catch { Write-Err "Ошибка: $_" }
+    Write-Info "Текущий состав группы $g :"
+    $m = @(Get-ADGroupMember -Identity $g @p)
+    if ($m.Count -eq 0) { Write-Warn "Группа пуста"; return }
+    $m | Sort-Object Name | Format-Table Name, SamAccountName, objectClass -AutoSize | Out-Host
+    $ud = (Get-ADUser -Identity $u @p).DistinguishedName
+    if (-not ($m | Where-Object { $_.distinguishedName -eq $ud })) { Write-Warn "$u не состоит в группе $g"; return }
+    if ((Read-Host "Убрать $u из $g ? (y/n)") -eq 'y') {
+        try { Remove-ADGroupMember -Identity $g -Members $u -Confirm:$false @p -ErrorAction Stop; Write-Ok "$u убран из $g" }
+        catch { Write-Err "Ошибка: $_" }
+    } else { Write-Warn "Отменено" }
 }
 
 # ---------- Генератор случайных людей (те же списки, что в gen_users.py) ----------
@@ -478,9 +605,15 @@ function Invoke-Cleanup {
     Write-Title "Очистка созданного наполнением"
     $ouDN = "OU=$OuName,$($script:DomainDN)"
     if (-not (Get-ADOrganizationalUnit -Filter "DistinguishedName -eq '$ouDN'" @p)) { Write-Warn "Подразделение $OuName не найдено: удалять нечего"; return }
-    $users  = @(Get-ADUser  -SearchBase $ouDN -SearchScope Subtree -Filter * @p)
-    $groups = @(Get-ADGroup -SearchBase $ouDN -SearchScope Subtree -Filter * @p)
-    Write-Warn "Будет удалено: пользователей $($users.Count), групп $($groups.Count), подразделение $OuName"
+    $users  = @(Get-ADUser  -SearchBase $ouDN -SearchScope Subtree -Filter * -Properties Department @p)
+    $groups = @(Get-ADGroup -SearchBase $ouDN -SearchScope Subtree -Filter * -Properties Members @p)
+    $ous    = @(Get-ADOrganizationalUnit -SearchBase $ouDN -SearchScope Subtree -Filter * @p)
+    Write-Info "Содержимое подразделения $ouDN :"
+    if ($users.Count)  { Write-Host "`nПользователи ($($users.Count)):"; $users | Sort-Object SamAccountName | Format-Table SamAccountName, Name, Department, Enabled -AutoSize | Out-Host }
+    if ($groups.Count) { Write-Host "Группы ($($groups.Count)):"; $groups | Sort-Object Name | Format-Table Name, GroupScope, @{ n = 'Участников'; e = { @($_.Members).Count } } -AutoSize | Out-Host }
+    if ($ous.Count -gt 1) { Write-Host "Вложенные подразделения:"; $ous | Where-Object { $_.DistinguishedName -ne $ouDN } | Format-Table Name, DistinguishedName -AutoSize | Out-Host }
+    Write-Warn "Будет удалено: пользователей $($users.Count), групп $($groups.Count), подразделений $($ous.Count) (включая $OuName)."
+    Write-Warn "Проверь список: если в подразделении есть чужие учётные записи, они тоже будут удалены."
     if ((Read-Host "Удалить без возможности восстановления? Введи yes") -ne 'yes') { Write-Warn "Отменено"; return }
     foreach ($u in $users)  { try { Remove-ADUser  -Identity $u.DistinguishedName -Confirm:$false @p -ErrorAction Stop } catch { Write-Err "Ошибка при удалении $($u.SamAccountName): $_" } }
     foreach ($g in $groups) { try { Remove-ADGroup -Identity $g.DistinguishedName -Confirm:$false @p -ErrorAction Stop } catch { Write-Err "Ошибка при удалении группы $($g.Name): $_" } }
@@ -515,7 +648,7 @@ function Show-MainMenu {
     )
     do {
         Clear-Host
-        Write-Host "========== УПРАВЛЕНИЕ AD: $($script:DomainFQDN) ==========" -ForegroundColor Magenta
+        Show-Header
         for ($i = 0; $i -lt $menu.Count; $i++) { Write-Host ("{0,2}. {1}" -f ($i + 1), $menu[$i].T) }
         Write-Host " 0. Выход"
         $choice = Read-Host "`nВыбери действие"
